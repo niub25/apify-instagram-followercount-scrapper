@@ -34,21 +34,18 @@ const savedState = await Actor.getValue('STATE') ?? {};
 
 const doneUsernames = new Set(savedState.doneUsernames ?? []);
 
-// Build queue from input, skip already-processed ones
-const usernameQueue = inputUsernames
-    .map(u => u.trim().replace(/^@/, '').toLowerCase())
-    .filter(u => u && !doneUsernames.has(u));
-
-// De-duplicate
+// Build queue from input — strip @, lowercase, dedupe, skip already done
 const seen = new Set();
-const pendingQueue = usernameQueue.filter(u => {
-    if (seen.has(u)) return false;
-    seen.add(u);
-    return true;
-});
+const pendingQueue = inputUsernames
+    .map(u => u.trim().replace(/^@/, '').toLowerCase())
+    .filter(u => {
+        if (!u || doneUsernames.has(u) || seen.has(u)) return false;
+        seen.add(u);
+        return true;
+    });
 
 console.log([
-    `Restored state: ${doneUsernames.size} already done`,
+    `Restored state : ${doneUsernames.size} already done`,
     `Pending        : ${pendingQueue.length} usernames to process`,
     `Total input    : ${inputUsernames.length}`,
 ].join('\n'));
@@ -107,111 +104,203 @@ await igPage.goto('https://www.instagram.com/', {
     timeout: 30_000,
 }).catch(e => console.log(`Nav warning: ${e.message}`));
 
-// ─── Core fetch helper (runs inside browser — uses session cookies) ───────────
+// ─── Core fetch helper ────────────────────────────────────────────────────────
+// Returns { data, status } — data is null on failure, status is the HTTP code.
+// Exposing status lets callers detect 401 vs 404 vs 429 and act accordingly.
 
-async function igFetch(url) {
+async function igFetch(url, referer = 'https://www.instagram.com/') {
     try {
-        const result = await igPage.evaluate(async (u) => {
+        const result = await igPage.evaluate(async ({ u, ref }) => {
             try {
                 const r = await fetch(u, {
                     headers: {
                         'X-IG-App-ID':      '936619743392459',
                         'X-ASBD-ID':        '129477',
+                        'X-IG-WWW-Claim':   '0',
                         'Accept':           '*/*',
+                        'Accept-Language':  'en-US,en;q=0.9',
                         'X-Requested-With': 'XMLHttpRequest',
+                        'Referer':          ref,
                     },
                     credentials: 'include',
                 });
-                if (!r.ok) return { error: r.status };
-                return { data: await r.json() };
+                if (!r.ok) return { data: null, status: r.status };
+                const data = await r.json();
+                return { data, status: 200 };
             } catch (e) {
-                return { error: e.message };
+                return { data: null, status: 0, error: e.message };
             }
-        }, url);
-        return result?.data ?? null;
-    } catch {
-        return null;
+        }, { u: url, ref: referer });
+
+        return {
+            data:   result?.data   ?? null,
+            status: result?.status ?? 0,
+        };
+    } catch (e) {
+        return { data: null, status: 0 };
     }
 }
 
-// ─── Fetch follower count for one username ────────────────────────────────────
+// ─── Strategy 1: web_profile_info API ────────────────────────────────────────
 
-const RETRY_DELAYS = [2_000, 5_000, 10_000]; // ms between retries on failure
+async function fetchViaApi(username) {
+    const url      = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
+    const referer  = `https://www.instagram.com/${username}/`;
+    const { data, status } = await igFetch(url, referer);
 
-async function fetchFollowers(username) {
-    // Primary endpoint — web profile info
-    const primaryUrl =
-        `https://www.instagram.com/api/v1/users/web_profile_info/` +
-        `?username=${encodeURIComponent(username)}`;
+    if (status === 404) return { found: false, followers: null, source: 'api_404' };
+    if (!data)         return { found: null,  followers: null, status };   // null = "unknown, try fallback"
 
-    for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
-        const data = await igFetch(primaryUrl);
+    const user = data?.data?.user;
+    if (!user)         return { found: false, followers: null, source: 'api_no_user' };
 
-        if (data) {
-            const user = data?.data?.user;
-            if (user) {
-                return {
-                    found: true,
-                    followers: user.edge_followed_by?.count ?? user.follower_count ?? null,
-                    source: 'web_profile_info',
-                };
+    return {
+        found:     true,
+        followers: user.edge_followed_by?.count ?? user.follower_count ?? null,
+        source:    'web_profile_info',
+    };
+}
+
+// ─── Strategy 2: page navigation with response interception ──────────────────
+// Navigate to the actual profile page. Instagram loads web_profile_info itself —
+// we intercept that response instead of calling the API directly.
+// This bypasses header/auth issues because the browser makes the request in full
+// page context (with all cookies, headers, and proper referrer chain).
+
+async function fetchViaPageIntercept(username) {
+    let followers  = null;
+    let userExists = true;
+
+    const profileUrl = `https://www.instagram.com/${username}/`;
+
+    // Listen for the API response Instagram makes when loading a profile
+    const handleResponse = async (response) => {
+        try {
+            if (
+                response.url().includes('web_profile_info') ||
+                response.url().includes(`/api/v1/users/`) && response.url().includes('/info/')
+            ) {
+                const body = await response.json().catch(() => null);
+                const user = body?.data?.user ?? body?.user;
+                if (user) {
+                    followers = user.edge_followed_by?.count ?? user.follower_count ?? null;
+                }
             }
+        } catch { /* ignore */ }
+    };
+
+    igPage.on('response', handleResponse);
+
+    try {
+        const response = await igPage.goto(profileUrl, {
+            waitUntil: 'networkidle',
+            timeout:   20_000,
+        });
+
+        // Check HTTP status of the page itself
+        if (response?.status() === 404) {
+            userExists = false;
         }
 
-        // Detect hard 404 / user not found (no point retrying)
-        if (data === null && attempt === 0) {
-            // Try fallback endpoint before giving up
-            const fallbackUrl =
-                `https://i.instagram.com/api/v1/users/lookup/` +
-                `?username=${encodeURIComponent(username)}`;
-            const fallback = await igFetch(fallbackUrl);
-            const fbUser = fallback?.user ?? fallback?.users?.[0];
-            if (fbUser) {
-                return {
-                    found: true,
-                    followers: fbUser.follower_count ?? null,
-                    source: 'users_lookup',
-                };
-            }
+        // Give intercepted XHRs a moment to resolve
+        await new Promise(r => setTimeout(r, 1_000));
+
+        // Last-resort: scrape follower count from page JSON data
+        if (followers === null && userExists) {
+            followers = await igPage.evaluate(() => {
+                // Instagram embeds user data in <script> tags
+                const scripts = [...document.querySelectorAll('script[type="application/json"]')];
+                for (const s of scripts) {
+                    try {
+                        const obj = JSON.parse(s.textContent);
+                        const str = JSON.stringify(obj);
+                        const m   = str.match(/"edge_followed_by":\{"count":(\d+)\}/);
+                        if (m) return parseInt(m[1], 10);
+                    } catch { /* skip */ }
+                }
+                // Also check inline scripts
+                const allScripts = [...document.querySelectorAll('script:not([src])')];
+                for (const s of allScripts) {
+                    const m = s.textContent?.match(/"edge_followed_by":\{"count":(\d+)\}/);
+                    if (m) return parseInt(m[1], 10);
+                    const m2 = s.textContent?.match(/"follower_count":(\d+)/);
+                    if (m2) return parseInt(m2[1], 10);
+                }
+                return null;
+            });
         }
 
-        if (attempt < RETRY_DELAYS.length) {
-            console.log(`  [${username}] attempt ${attempt + 1} failed — retrying in ${RETRY_DELAYS[attempt] / 1000}s`);
-            await new Promise(r => setTimeout(r, RETRY_DELAYS[attempt]));
-        }
+    } catch (e) {
+        console.log(`  [page_intercept] navigation error: ${e.message}`);
+    } finally {
+        igPage.off('response', handleResponse);
     }
 
-    return { found: false, followers: null, source: null };
+    if (!userExists)      return { found: false, followers: null,     source: 'page_404' };
+    if (followers !== null) return { found: true,  followers,           source: 'page_intercept' };
+    return                        { found: null,   followers: null,     source: 'page_no_data' };
+}
+
+// ─── Main fetch orchestrator ──────────────────────────────────────────────────
+// Strategy 1 (fast API) → Strategy 2 (page navigation) → give up
+// Rate limit (429) triggers a longer pause before continuing.
+
+async function fetchFollowers(username) {
+    // ── Strategy 1: direct API call ───────────────────────────────────────────
+    const apiResult = await fetchViaApi(username);
+
+    if (apiResult.found === true)  return apiResult;   // success
+    if (apiResult.found === false) return apiResult;   // definitive 404
+
+    // found === null means the API gave a non-404 error — log the status
+    const { status } = apiResult;
+    console.log(`  [${username}] API error HTTP ${status} → trying page intercept`);
+
+    // 429 rate limit — back off before the next strategy
+    if (status === 429) {
+        console.log(`  [${username}] Rate limited — waiting 15s`);
+        await new Promise(r => setTimeout(r, 15_000));
+    }
+
+    // ── Strategy 2: full page navigation + interception ───────────────────────
+    const pageResult = await fetchViaPageIntercept(username);
+
+    if (pageResult.found === true)  return pageResult;
+    if (pageResult.found === false) return pageResult;
+
+    // Both strategies failed
+    console.log(`  [${username}] Both strategies failed`);
+    return { found: false, followers: null, source: 'all_failed' };
 }
 
 // ─── API smoke test ───────────────────────────────────────────────────────────
 
 console.log('\nTesting API...');
-const testData = await igFetch(
-    'https://www.instagram.com/api/v1/users/web_profile_info/?username=instagram'
+const { data: testData, status: testStatus } = await igFetch(
+    'https://www.instagram.com/api/v1/users/web_profile_info/?username=instagram',
+    'https://www.instagram.com/instagram/'
 );
-if (!testData?.data?.user) {
-    console.log(
-        'ERROR: API test failed.\n' +
-        'ACTION: Refresh sessionId and csrfToken from Chrome DevTools and retry.'
-    );
-    await browser.close();
-    await Actor.exit();
+
+if (testData?.data?.user) {
+    const testFollowers = testData.data.user.edge_followed_by?.count;
+    console.log(`Strategy 1 (API) OK — @instagram has ${testFollowers?.toLocaleString()} followers`);
+} else {
+    console.log(`Strategy 1 (API) returned HTTP ${testStatus} — will rely on page intercept fallback`);
+    if (testStatus === 401 || testStatus === 403) {
+        console.log('TIP: Try refreshing your sessionId and csrfToken from Chrome DevTools.');
+    }
 }
-const testFollowers = testData.data.user.edge_followed_by?.count;
-console.log(`API OK — @instagram has ${testFollowers?.toLocaleString()} followers`);
 
 // ─── Main loop ────────────────────────────────────────────────────────────────
 
 const total   = pendingQueue.length;
 let succeeded = 0;
 let failed    = 0;
-let skipped   = 0;
 
 console.log([
-    `\n${'─'.repeat(50)}`,
+    `\n${'─'.repeat(55)}`,
     `Processing ${total} usernames`,
-    `${'─'.repeat(50)}`,
+    `${'─'.repeat(55)}`,
 ].join('\n'));
 
 for (let i = 0; i < pendingQueue.length; i++) {
@@ -220,35 +309,19 @@ for (let i = 0; i < pendingQueue.length; i++) {
 
     const { found, followers, source } = await fetchFollowers(username);
 
+    await Dataset.pushData({
+        username,
+        followers: followers ?? null,
+        scrapedAt: new Date().toISOString(),
+    });
+    doneUsernames.add(username);
+
     if (found && followers !== null) {
-        await Dataset.pushData({
-            username,
-            followers,
-            scrapedAt: new Date().toISOString(),
-        });
-        doneUsernames.add(username);
         succeeded++;
-        console.log(`${progress} @${username.padEnd(30)} → ${followers.toLocaleString()} followers  [${source}]`);
-    } else if (found && followers === null) {
-        // Profile exists but follower count wasn't in response
-        await Dataset.pushData({
-            username,
-            followers: null,
-            scrapedAt: new Date().toISOString(),
-        });
-        doneUsernames.add(username);
-        skipped++;
-        console.log(`${progress} @${username.padEnd(30)} → followers unavailable`);
+        console.log(`${progress} @${username.padEnd(32)} → ${String(followers.toLocaleString()).padStart(10)} followers  [${source}]`);
     } else {
-        // Profile not found or all retries exhausted
-        await Dataset.pushData({
-            username,
-            followers: null,
-            scrapedAt: new Date().toISOString(),
-        });
-        doneUsernames.add(username);
         failed++;
-        console.log(`${progress} @${username.padEnd(30)} → not found / failed`);
+        console.log(`${progress} @${username.padEnd(32)} → not found / failed  [${source}]`);
     }
 
     // Checkpoint every 50 profiles
@@ -257,24 +330,21 @@ for (let i = 0; i < pendingQueue.length; i++) {
         console.log(`  [checkpoint] ${i + 1} done, state saved`);
     }
 
-    // Small delay between requests to avoid rate limiting
     await new Promise(r => setTimeout(r, 300));
 }
 
 // ─── Teardown ─────────────────────────────────────────────────────────────────
 
 await browser.close();
-
 await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
 
 console.log([
-    `\n${'═'.repeat(50)}`,
+    `\n${'═'.repeat(55)}`,
     `DONE`,
     `  Total processed : ${doneUsernames.size}`,
     `  Succeeded        : ${succeeded}`,
     `  Not found/failed : ${failed}`,
-    `  No count data    : ${skipped}`,
-    `${'═'.repeat(50)}`,
+    `${'═'.repeat(55)}`,
 ].join('\n'));
 
 await Actor.exit();
