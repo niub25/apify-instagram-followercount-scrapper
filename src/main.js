@@ -1,6 +1,6 @@
-import { Actor } from 'apify';
+import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
-import { chromium } from 'playwright';
+import { gotScraping } from 'got-scraping';
 
 await Actor.init();
 
@@ -9,13 +9,19 @@ await Actor.init();
 const input = await Actor.getInput();
 const {
     usernames: inputUsernames = [],
-    sessionId,
-    csrfToken,
+    sessions:  inputSessions  = [],
+    concurrency               = 5,
     proxyConfiguration,
 } = input;
 
-if (!sessionId) { console.log('ERROR: sessionId is required.'); await Actor.exit(); }
-if (!inputUsernames?.length) { console.log('ERROR: usernames array is empty.'); await Actor.exit(); }
+if (!inputUsernames?.length) {
+    log.error('usernames array is empty.');
+    await Actor.exit();
+}
+if (!inputSessions?.length) {
+    log.error('sessions array is empty. Add at least one Instagram session.');
+    await Actor.exit();
+}
 
 const proxyConfig = await Actor.createProxyConfiguration(
     proxyConfiguration ?? {
@@ -30,214 +36,273 @@ const proxyConfig = await Actor.createProxyConfiguration(
 const savedState    = await Actor.getValue('STATE') ?? {};
 const doneUsernames = new Set(savedState.doneUsernames ?? []);
 
-const seen = new Set();
+const seenDedup = new Set();
 const pendingQueue = inputUsernames
     .map(u => u.trim().replace(/^@/, '').toLowerCase())
-    .filter(u => { if (!u || doneUsernames.has(u) || seen.has(u)) return false; seen.add(u); return true; });
+    .filter(u => {
+        if (!u || doneUsernames.has(u) || seenDedup.has(u)) return false;
+        seenDedup.add(u);
+        return true;
+    });
 
-console.log(`Restored: ${doneUsernames.size} done | Pending: ${pendingQueue.length} | Total: ${inputUsernames.length}`);
+log.info([
+    `Sessions  : ${inputSessions.length}`,
+    `Restored  : ${doneUsernames.size} already done`,
+    `Pending   : ${pendingQueue.length}`,
+    `Total     : ${inputUsernames.length}`,
+    `Concurrency: ${concurrency}`,
+].join(' | '));
 
 Actor.on('migrating', async () => {
     await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
-    console.log(`[MIGRATION] Saved — ${doneUsernames.size} done`);
+    log.info(`[MIGRATION] Saved — ${doneUsernames.size} done`);
 });
 
-// ─── Browser ──────────────────────────────────────────────────────────────────
+// ─── Session pool ─────────────────────────────────────────────────────────────
+// Each session = one Instagram account (sessionId + csrfToken).
+// Rotation strategy:
+//   - Pick the session with the fewest requests that isn't in cooldown
+//   - On 429/block: put that session in cooldown (escalating: 60s→120s→300s)
+//   - On success: decrement consecutive fail count
+//   - If ALL sessions are in cooldown: wait for the earliest one to recover
 
-console.log('\nLaunching browser...');
-const proxyUrl  = await proxyConfig.newUrl('ig_browser');
-const proxyHost = proxyUrl ? new URL(proxyUrl) : null;
+class SessionPool {
+    constructor(sessions) {
+        this.pool = sessions.map((s, i) => ({
+            id:             i,
+            sessionId:      s.sessionId,
+            csrfToken:      s.csrfToken || '',
+            requests:       0,
+            consecutiveFails: 0,
+            cooldownUntil:  0,
+        }));
+    }
 
-const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
-    proxy: proxyHost ? {
-        server:   `${proxyHost.protocol}//${proxyHost.host}`,
-        username: proxyHost.username ? decodeURIComponent(proxyHost.username) : undefined,
-        password: proxyHost.password ? decodeURIComponent(proxyHost.password) : undefined,
-    } : undefined,
-});
+    // Returns the best available session, or null if all are cooling down
+    acquire() {
+        const now = Date.now();
+        const available = this.pool
+            .filter(s => s.cooldownUntil <= now && s.consecutiveFails < 5)
+            .sort((a, b) => a.requests - b.requests); // prefer least-used
+        return available[0] ?? null;
+    }
+
+    // How long until the next session recovers from cooldown (ms)
+    msUntilNextAvailable() {
+        const now = Date.now();
+        const soonest = this.pool
+            .filter(s => s.cooldownUntil > now && s.consecutiveFails < 5)
+            .sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
+        return soonest ? Math.max(0, soonest.cooldownUntil - now) : null;
+    }
+
+    onSuccess(session) {
+        session.requests++;
+        session.consecutiveFails = Math.max(0, session.consecutiveFails - 1);
+    }
+
+    onBlock(session) {
+        session.consecutiveFails++;
+        // Escalating cooldown: 60s, 120s, 300s, 600s
+        const cooldownMs = Math.min(60_000 * session.consecutiveFails, 600_000);
+        session.cooldownUntil = Date.now() + cooldownMs;
+        log.warning(
+            `Session #${session.id} blocked` +
+            ` (${session.consecutiveFails}× consecutive)` +
+            ` — cooldown ${cooldownMs / 1000}s`
+        );
+    }
+
+    onError(session) {
+        session.consecutiveFails++;
+    }
+
+    allDead() {
+        return this.pool.every(s => s.consecutiveFails >= 5);
+    }
+
+    stats() {
+        return this.pool.map(s => {
+            const coolLeft = Math.max(0, s.cooldownUntil - Date.now());
+            return `#${s.id}[${s.requests}req,${coolLeft > 0 ? `cd${Math.ceil(coolLeft/1000)}s` : 'ok'}]`;
+        }).join(' ');
+    }
+}
+
+const sessionPool = new SessionPool(inputSessions);
+
+// ─── HTTP fetch ───────────────────────────────────────────────────────────────
+// Pure HTTP via got-scraping — no browser, no Playwright.
+// got-scraping mimics real browser TLS fingerprints at the network level,
+// which is the same technique the working Apify actor uses with CheerioCrawler.
 
 const IG_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-const context = await browser.newContext({ userAgent: IG_UA, viewport: { width: 390, height: 844 } });
-
-await context.addCookies([
-    { name: 'sessionid', value: sessionId, domain: '.instagram.com', path: '/', httpOnly: true, secure: true },
-    ...(csrfToken ? [{ name: 'csrftoken', value: csrfToken, domain: '.instagram.com', path: '/', secure: true }] : []),
-]);
-
-// ─── Warmup: navigate to Instagram to establish session context ───────────────
-
-const igPage = await context.newPage();
-console.log('Warming up session...');
-try {
-    await igPage.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 25_000 });
-    await new Promise(r => setTimeout(r, 2_000));
-    console.log('Warmup done');
-} catch (e) {
-    console.log(`Warmup warning (non-fatal): ${e.message.split('\n')[0]}`);
-}
-
-// ─── API fetch via context.request ───────────────────────────────────────────
-// Uses Playwright's native HTTP client — reads cookies from browser context,
-// no origin/CORS issues, no dependency on page navigation state.
-// This is the approach that successfully returned 500+ followers in earlier runs.
-
-const IG_HEADERS = {
-    'X-IG-App-ID':      '936619743392459',
-    'X-ASBD-ID':        '129477',
-    'X-IG-WWW-Claim':   '0',
-    'Accept':           '*/*',
-    'Accept-Language':  'en-US,en;q=0.9',
-    'X-Requested-With': 'XMLHttpRequest',
-    'User-Agent':       IG_UA,
-};
-
-async function fetchViaApi(username) {
+async function fetchFollowers(username) {
     const url = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
-    try {
-        const res    = await context.request.get(url, {
-            headers: { ...IG_HEADERS, 'Referer': `https://www.instagram.com/${username}/` },
-            timeout: 15_000,
-        });
-        const status = res.status();
-        if (status === 404) return { found: false, followers: null, source: 'not_found', status };
-        if (status === 429) return { found: null,  followers: null, source: 'rate_limit', status };
-        if (!res.ok())      return { found: null,  followers: null, source: 'api_error',  status };
-        const body = await res.json();
-        const user = body?.data?.user;
-        if (!user)          return { found: false, followers: null, source: 'no_user',    status };
-        return { found: true, followers: user.edge_followed_by?.count ?? user.follower_count ?? null, source: 'api', status };
-    } catch {
-        return { found: null, followers: null, source: 'exception', status: 0 };
-    }
-}
 
-// ─── Rate limit handling ──────────────────────────────────────────────────────
-//
-// Strategy: when rate limited, pause and retry.
-// The base delay between requests also increases after each 429 event,
-// so the run automatically slows down to avoid continued blocking.
-// After MAX_RL_EVENTS consecutive 429s, abort and save state.
-
-let   requestDelay    = 800;    // ms between requests — increases on 429 events
-let   rl429Events     = 0;      // consecutive 429 events (resets on success)
-const MAX_RL_EVENTS   = 5;      // abort after this many consecutive 429 events
-const RL_PAUSE_MS     = 3 * 60_000;  // 3-minute pause on each 429 event
-
-async function fetchWithRateLimitHandling(username) {
-    for (let attempt = 0; attempt <= 2; attempt++) {
-        const result = await fetchViaApi(username);
-
-        if (result.source === 'rate_limit') {
-            rl429Events++;
-
-            if (rl429Events >= MAX_RL_EVENTS) {
-                console.log([
-                    ``,
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
-                    `ABORT — ${MAX_RL_EVENTS} consecutive rate limit events`,
-                    ``,
-                    `The session or proxy IP is fully blocked.`,
-                    `  1. Wait 30–60 minutes`,
-                    `  2. Get fresh sessionId + csrfToken from Chrome`,
-                    `  3. Re-run — state is saved, resumes where it stopped`,
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
-                ].join('\n'));
-                await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
-                await browser.close();
-                await Actor.exit();
+    for (let attempt = 0; attempt < inputSessions.length + 2; attempt++) {
+        // Wait for an available session
+        let session = sessionPool.acquire();
+        while (!session) {
+            if (sessionPool.allDead()) {
+                return { found: false, followers: null, source: 'all_sessions_dead' };
             }
-
-            // Increase base delay — slow down to reduce future 429s
-            requestDelay = Math.min(requestDelay + 500, 3_000);
-            console.log(
-                `  [${username}] 429 (event ${rl429Events}/${MAX_RL_EVENTS})` +
-                ` — pausing ${RL_PAUSE_MS / 60_000} min, new delay: ${requestDelay}ms`
-            );
-            await new Promise(r => setTimeout(r, RL_PAUSE_MS));
-            continue; // retry same username after pause
+            const wait = sessionPool.msUntilNextAvailable() ?? 30_000;
+            log.warning(`All sessions cooling — waiting ${Math.ceil(wait / 1000)}s`);
+            await new Promise(r => setTimeout(r, wait + 1_000));
+            session = sessionPool.acquire();
         }
 
-        // Success or definitive failure — reset 429 counter
-        rl429Events = 0;
-        return result;
+        try {
+            const proxyUrl = await proxyConfig.newUrl(`s${session.id}`);
+
+            const response = await gotScraping({
+                url,
+                method:   'GET',
+                headers:  {
+                    'X-IG-App-ID':      '936619743392459',
+                    'X-ASBD-ID':        '129477',
+                    'X-IG-WWW-Claim':   '0',
+                    'Accept':           '*/*',
+                    'Accept-Language':  'en-US,en;q=0.9',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'User-Agent':       IG_UA,
+                    'Referer':          `https://www.instagram.com/${username}/`,
+                    'Cookie': `sessionid=${session.sessionId}${session.csrfToken ? `; csrftoken=${session.csrfToken}` : ''}`,
+                    ...(session.csrfToken ? { 'X-CSRFToken': session.csrfToken } : {}),
+                },
+                proxyUrl,
+                responseType:   'json',
+                timeout:        { request: 15_000 },
+                throwHttpErrors: false,
+                retry:          { limit: 0 },
+            });
+
+            const status = response.statusCode;
+
+            // ── Success ───────────────────────────────────────────────────────
+            if (status === 200) {
+                const user = response.body?.data?.user;
+                if (!user) {
+                    sessionPool.onSuccess(session);
+                    return { found: false, followers: null, source: 'no_user' };
+                }
+                sessionPool.onSuccess(session);
+                return {
+                    found:     true,
+                    followers: user.edge_followed_by?.count ?? user.follower_count ?? null,
+                    source:    `s${session.id}`,
+                };
+            }
+
+            // ── Not found ─────────────────────────────────────────────────────
+            if (status === 404) {
+                sessionPool.onSuccess(session);
+                return { found: false, followers: null, source: 'not_found' };
+            }
+
+            // ── Rate limited / blocked — rotate to next session ───────────────
+            if (status === 429 || status === 401 || status === 403) {
+                sessionPool.onBlock(session);
+                continue; // retry with a different session
+            }
+
+            // ── Other error ───────────────────────────────────────────────────
+            log.warning(`[${username}] HTTP ${status} on session #${session.id}`);
+            sessionPool.onError(session);
+
+        } catch (e) {
+            const msg = e.message?.split('\n')[0] ?? 'unknown error';
+            log.warning(`[${username}] Request error: ${msg}`);
+            sessionPool.onError(session);
+        }
+
+        // Brief pause before next attempt with a different session
+        await new Promise(r => setTimeout(r, 500));
     }
 
-    // All 3 attempts were rate-limited
-    return { found: false, followers: null, source: '429_skipped' };
+    return { found: false, followers: null, source: 'all_attempts_failed' };
 }
 
 // ─── Smoke test ───────────────────────────────────────────────────────────────
 
-console.log('\nTesting API...');
-const smoke = await fetchViaApi('instagram');
+log.info('Running smoke test...');
+const smoke = await fetchFollowers('instagram');
 
-if (smoke.source === 'api') {
-    console.log(`API OK — @instagram has ${smoke.followers?.toLocaleString()} followers`);
-} else if (smoke.source === 'rate_limit') {
-    console.log([
-        ``,
-        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
-        `ABORT — Session/proxy is rate limited before even starting`,
-        ``,
-        `  1. Wait 30–60 minutes for the block to clear`,
-        `  2. Get fresh sessionId + csrfToken from Chrome:`,
-        `       DevTools → Application → Cookies → instagram.com`,
-        `  3. Re-run — state is saved, will resume where it stopped`,
-        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+if (smoke.found) {
+    log.info(`Smoke test OK — @instagram has ${smoke.followers?.toLocaleString()} followers via session ${smoke.source}`);
+} else if (smoke.source === 'all_sessions_dead') {
+    log.error([
+        'ABORT — All sessions are blocked/dead.',
+        'Your session cookies are either expired or rate limited.',
+        'Get fresh sessionId + csrfToken from Chrome DevTools for each account.',
     ].join('\n'));
-    await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
-    await browser.close();
-    await Actor.exit();
-} else if (smoke.status === 401 || smoke.status === 403) {
-    console.log([
-        `ABORT — Session is invalid (HTTP ${smoke.status})`,
-        `Get fresh sessionId + csrfToken from Chrome and re-run.`,
-    ].join('\n'));
-    await browser.close();
     await Actor.exit();
 } else {
-    console.log(`API returned ${smoke.status} [${smoke.source}] — proceeding cautiously`);
+    log.warning(`Smoke test returned [${smoke.source}] — proceeding anyway`);
 }
 
-// ─── Main loop ────────────────────────────────────────────────────────────────
+// ─── Concurrent batch processor ───────────────────────────────────────────────
+// Processes `concurrency` usernames in parallel.
+// Each parallel slot independently picks from the session pool,
+// so sessions are used round-robin based on availability.
 
-const total   = pendingQueue.length;
-let succeeded = 0;
-let failed    = 0;
+const total     = pendingQueue.length;
+let   succeeded = 0;
+let   failed    = 0;
+let   processed = 0;
 
-console.log(`\n${'─'.repeat(55)}\nProcessing ${total} usernames\n${'─'.repeat(55)}`);
+log.info(`${'─'.repeat(55)}\nProcessing ${total} usernames with concurrency=${concurrency}\n${'─'.repeat(55)}`);
 
-for (let i = 0; i < pendingQueue.length; i++) {
-    const username = pendingQueue[i];
-    const progress = `[${i + 1 + doneUsernames.size}/${total + doneUsernames.size}]`;
+async function processOne(username, globalIndex) {
+    const progress = `[${globalIndex + 1 + doneUsernames.size}/${total + doneUsernames.size}]`;
+    const { found, followers, source } = await fetchFollowers(username);
 
-    const { found, followers, source } = await fetchWithRateLimitHandling(username);
-
-    await Dataset.pushData({ username, followers: followers ?? null, scrapedAt: new Date().toISOString() });
+    await Dataset.pushData({
+        username,
+        followers: followers ?? null,
+        scrapedAt: new Date().toISOString(),
+    });
     doneUsernames.add(username);
 
     if (found && followers !== null) {
         succeeded++;
-        console.log(`${progress} @${username.padEnd(32)} → ${String(followers.toLocaleString()).padStart(10)} followers  [${source}]`);
+        log.info(`${progress} @${username.padEnd(30)} → ${String(followers.toLocaleString()).padStart(10)} followers  [${source}]`);
     } else {
         failed++;
-        console.log(`${progress} @${username.padEnd(32)} → failed  [${source}]`);
+        log.info(`${progress} @${username.padEnd(30)} → failed  [${source}]`);
     }
+    processed++;
+}
 
-    if ((i + 1) % 50 === 0) {
+// Process in chunks of `concurrency` — each chunk runs in parallel
+for (let i = 0; i < pendingQueue.length; i += concurrency) {
+    const chunk = pendingQueue.slice(i, i + concurrency);
+
+    await Promise.all(
+        chunk.map((username, j) => processOne(username, i + j))
+    );
+
+    // Checkpoint every 200 profiles
+    if (processed % 200 < concurrency || i + concurrency >= pendingQueue.length) {
         await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
-        console.log(`  [checkpoint] ${i + 1} done, state saved`);
+        log.info(`[checkpoint] ${processed} done | sessions: ${sessionPool.stats()}`);
     }
-
-    await new Promise(r => setTimeout(r, requestDelay));
 }
 
 // ─── Teardown ─────────────────────────────────────────────────────────────────
 
-await browser.close();
 await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
-console.log(`\nDONE — processed: ${doneUsernames.size} | succeeded: ${succeeded} | failed: ${failed}`);
+
+log.info([
+    `${'═'.repeat(55)}`,
+    `DONE`,
+    `  Processed  : ${doneUsernames.size}`,
+    `  Succeeded  : ${succeeded}`,
+    `  Failed     : ${failed}`,
+    `  Sessions   : ${sessionPool.stats()}`,
+    `${'═'.repeat(55)}`,
+].join('\n'));
+
 await Actor.exit();
