@@ -77,7 +77,6 @@ const context = await browser.newContext({
     viewport:  { width: 390, height: 844 },
 });
 
-// Inject session cookies
 await context.addCookies([
     { name: 'sessionid', value: sessionId,  domain: '.instagram.com', path: '/', httpOnly: true, secure: true },
     ...(csrfToken
@@ -85,14 +84,42 @@ await context.addCookies([
         : []),
 ]);
 
-// igPage is used only for Strategy 2 (page-based fallback)
 const igPage = await context.newPage();
 
+// ─── Rate limit state ─────────────────────────────────────────────────────────
+// Tracks consecutive 429s across all requests.
+// On each 429: one global pause, then single retry.
+// If MAX_CONSECUTIVE_429 is hit: abort — session is fully blocked.
+
+const GLOBAL_RL_PAUSE      = 90_000;   // 90s cool-down on any 429
+const MAX_CONSECUTIVE_429  = 10;       // abort after this many in a row
+let   consecutive429s      = 0;
+
+async function onRateLimit(username) {
+    consecutive429s++;
+    console.log(
+        `  [${username}] 429 rate limited` +
+        ` (${consecutive429s} consecutive) — global pause ${GLOBAL_RL_PAUSE / 1000}s`
+    );
+
+    if (consecutive429s >= MAX_CONSECUTIVE_429) {
+        console.log([
+            ``,
+            `ABORT: ${MAX_CONSECUTIVE_429} consecutive 429s.`,
+            `The session or proxy IP appears fully blocked by Instagram.`,
+            `Wait ~10–15 minutes, then either:`,
+            `  1. Re-run — state is saved, it will resume where it left off`,
+            `  2. Refresh sessionId + csrfToken from Chrome DevTools`,
+        ].join('\n'));
+        await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
+        await browser.close();
+        await Actor.exit();
+    }
+
+    await new Promise(r => setTimeout(r, GLOBAL_RL_PAUSE));
+}
+
 // ─── Strategy 1: Playwright APIRequestContext ─────────────────────────────────
-// Uses context.request.get() — reads cookies from the browser context directly,
-// independent of what page is currently loaded. No origin/CORS issues, no warmup
-// navigation needed. This replaces the old page.evaluate(fetch(...)) approach
-// which broke whenever the warmup navigation timed out.
 
 const IG_HEADERS = {
     'X-IG-App-ID':      '936619743392459',
@@ -108,15 +135,11 @@ async function fetchViaApi(username) {
     const url = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
     try {
         const response = await context.request.get(url, {
-            headers: {
-                ...IG_HEADERS,
-                'Referer': `https://www.instagram.com/${username}/`,
-            },
+            headers: { ...IG_HEADERS, 'Referer': `https://www.instagram.com/${username}/` },
             timeout: 15_000,
         });
 
         const status = response.status();
-
         if (status === 404) return { found: false, followers: null, source: 'api_404',    status };
         if (!response.ok()) return { found: null,  followers: null, source: 'api_error',  status };
 
@@ -130,14 +153,13 @@ async function fetchViaApi(username) {
             source:    'web_profile_info',
             status:    200,
         };
-    } catch (e) {
+    } catch {
         return { found: null, followers: null, source: 'api_exception', status: 0 };
     }
 }
 
 // ─── Strategy 2: page navigation + response interception ─────────────────────
-// Only triggered for hard auth errors (401/403) — not for 429 rate limits,
-// since a rate-limited IP will also fail page loads.
+// Only used for hard auth errors (401/403), not for 429.
 
 async function fetchViaPageIntercept(username) {
     let followers  = null;
@@ -148,15 +170,12 @@ async function fetchViaPageIntercept(username) {
             if (response.url().includes('web_profile_info')) {
                 const body = await response.json().catch(() => null);
                 const user = body?.data?.user ?? body?.user;
-                if (user) {
-                    followers = user.edge_followed_by?.count ?? user.follower_count ?? null;
-                }
+                if (user) followers = user.edge_followed_by?.count ?? user.follower_count ?? null;
             }
         } catch { /* ignore */ }
     };
 
     igPage.on('response', handleResponse);
-
     try {
         const navResponse = await igPage.goto(`https://www.instagram.com/${username}/`, {
             waitUntil: 'domcontentloaded',
@@ -164,10 +183,8 @@ async function fetchViaPageIntercept(username) {
         });
         if (navResponse?.status() === 404) userExists = false;
 
-        // Wait briefly for XHR responses after DOM load
         await new Promise(r => setTimeout(r, 2_000));
 
-        // Last resort: scrape from inline page scripts
         if (followers === null && userExists) {
             followers = await igPage.evaluate(() => {
                 for (const s of document.querySelectorAll('script')) {
@@ -186,72 +203,105 @@ async function fetchViaPageIntercept(username) {
         igPage.off('response', handleResponse);
     }
 
-    if (!userExists)        return { found: false, followers: null,  source: 'page_404' };
-    if (followers !== null) return { found: true,  followers,        source: 'page_intercept' };
-    return                         { found: null,  followers: null,  source: 'page_no_data' };
+    if (!userExists)        return { found: false, followers: null, source: 'page_404' };
+    if (followers !== null) return { found: true,  followers,       source: 'page_intercept' };
+    return                         { found: null,  followers: null, source: 'page_no_data' };
 }
 
 // ─── Fetch orchestrator ───────────────────────────────────────────────────────
 //
-//   Strategy 1 (fast API via context.request)
-//     ├─ success  → done
-//     ├─ 404      → user not found
-//     ├─ 429      → wait & retry Strategy 1 (up to 3×, escalating backoff)
-//     │              page intercept NOT used — rate-limited IP fails page loads too
-//     └─ 401/403  → try Strategy 2 (page navigation)
-//
-//   Strategy 2 (page navigation + interception)
-//     ├─ success  → done
-//     └─ failed   → record as failed
-
-const RATE_LIMIT_BACKOFF = [30_000, 60_000, 90_000];
+//   Strategy 1 (API)
+//     ├─ success        → done, reset consecutive429 counter
+//     ├─ 404            → user not found
+//     ├─ 429            → global 90s pause → single retry
+//     │                    still 429 → skip (don't retry forever)
+//     │                    10 consecutive 429s → abort actor
+//     └─ 401/403/other  → Strategy 2 (page intercept)
 
 async function fetchFollowers(username) {
-    let lastStatus = 0;
+    const first = await fetchViaApi(username);
 
-    for (let attempt = 0; attempt < RATE_LIMIT_BACKOFF.length; attempt++) {
-        const result = await fetchViaApi(username);
+    if (first.found === true)  { consecutive429s = 0; return first; }
+    if (first.found === false) { consecutive429s = 0; return first; }
 
-        if (result.found === true)  return result;
-        if (result.found === false) return result;
+    if (first.status === 429) {
+        await onRateLimit(username);
 
-        lastStatus = result.status;
-
-        if (lastStatus === 429) {
-            const wait = RATE_LIMIT_BACKOFF[attempt];
-            console.log(`  [${username}] 429 rate limited (attempt ${attempt + 1}/${RATE_LIMIT_BACKOFF.length}) — waiting ${wait / 1000}s`);
-            await new Promise(r => setTimeout(r, wait));
-            continue;
+        // Single retry after the pause
+        const retry = await fetchViaApi(username);
+        if (retry.found === true)  { consecutive429s = 0; return retry; }
+        if (retry.found === false) { consecutive429s = 0; return retry; }
+        if (retry.status === 429) {
+            // Still blocked — skip this username and keep going
+            return { found: false, followers: null, source: '429_skipped' };
         }
-
-        // Non-429 error → try page intercept
-        console.log(`  [${username}] API HTTP ${lastStatus} → trying page intercept`);
-        break;
+        // Retry gave a non-429 error — fall through to page intercept
     }
 
-    if (lastStatus === 429) {
-        console.log(`  [${username}] Rate limited after all retries — skipping`);
-        return { found: false, followers: null, source: '429_exhausted' };
-    }
-
-    const pageResult = await fetchViaPageIntercept(username);
-    if (pageResult.found === true || pageResult.found === false) return pageResult;
+    // Auth or other error → try page intercept
+    console.log(`  [${username}] API HTTP ${first.status} → trying page intercept`);
+    const page = await fetchViaPageIntercept(username);
+    if (page.found === true || page.found === false) return page;
 
     return { found: false, followers: null, source: 'all_failed' };
 }
 
 // ─── Smoke test ───────────────────────────────────────────────────────────────
+// Runs before processing any usernames.
+// If rate limited (429): abort immediately — no point burning time on 4000+ usernames
+//   when every request will fail. State is saved; re-run after refreshing the session.
+// If auth error (401/403): abort with instructions to refresh cookies.
+// If success: proceed normally.
 
 console.log('\nTesting API...');
-const testResult = await fetchViaApi('instagram');
-if (testResult.found === true) {
-    console.log(`API OK — @instagram has ${testResult.followers?.toLocaleString()} followers`);
+const smoke = await fetchViaApi('instagram');
+
+if (smoke.found === true) {
+    console.log(`API OK — @instagram has ${smoke.followers?.toLocaleString()} followers`);
+
+} else if (smoke.status === 429) {
+    console.log([
+        ``,
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+        `ABORT — Session is rate limited (HTTP 429)`,
+        ``,
+        `Your Instagram session or proxy IP is currently blocked.`,
+        `There is no point starting — every username would fail.`,
+        ``,
+        `What to do:`,
+        `  1. Wait 15–30 minutes for the rate limit to clear`,
+        `  2. Get a fresh sessionId + csrfToken from Chrome:`,
+        `       Open Instagram → DevTools → Application → Cookies`,
+        `       Copy "sessionid" and "csrftoken" values`,
+        `  3. Re-run — state is saved, it will resume from where it stopped`,
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+    ].join('\n'));
+    await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
+    await browser.close();
+    await Actor.exit();
+
+} else if (smoke.status === 401 || smoke.status === 403) {
+    console.log([
+        ``,
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+        `ABORT — Session invalid or expired (HTTP ${smoke.status})`,
+        ``,
+        `Your sessionId cookie is expired or incorrect.`,
+        ``,
+        `What to do:`,
+        `  1. Log in to Instagram in Chrome`,
+        `  2. Open DevTools → Application → Cookies → instagram.com`,
+        `  3. Copy the fresh "sessionid" and "csrftoken" values`,
+        `  4. Update the actor input and re-run`,
+        `     (state is saved — it will resume where it stopped)`,
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+    ].join('\n'));
+    await Actor.setValue('STATE', { doneUsernames: [...doneUsernames] });
+    await browser.close();
+    await Actor.exit();
+
 } else {
-    console.log(`API returned HTTP ${testResult.status} [${testResult.source}]`);
-    if (testResult.status === 401 || testResult.status === 403) {
-        console.log('TIP: Refresh sessionId and csrfToken from Chrome DevTools.');
-    }
-    // Do not exit — page intercept fallback may still work
+    console.log(`API returned HTTP ${smoke.status} [${smoke.source}] — page intercept fallback will be used`);
 }
 
 // ─── Main loop ────────────────────────────────────────────────────────────────
@@ -268,11 +318,7 @@ for (let i = 0; i < pendingQueue.length; i++) {
 
     const { found, followers, source } = await fetchFollowers(username);
 
-    await Dataset.pushData({
-        username,
-        followers: followers ?? null,
-        scrapedAt: new Date().toISOString(),
-    });
+    await Dataset.pushData({ username, followers: followers ?? null, scrapedAt: new Date().toISOString() });
     doneUsernames.add(username);
 
     if (found && followers !== null) {
