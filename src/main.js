@@ -24,7 +24,7 @@ if (!inputUsernames || inputUsernames.length === 0) {
 }
 
 const proxyConfig = await Actor.createProxyConfiguration(
-    proxyConfiguration ?? { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] }
+    proxyConfiguration ?? { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'], apifyProxyCountry: 'US' }
 );
 
 // ─── Restore state ────────────────────────────────────────────────────────────
@@ -85,6 +85,25 @@ await context.addCookies([
 ]);
 
 const igPage = await context.newPage();
+
+// ─── Warmup navigation ────────────────────────────────────────────────────────
+// Visit Instagram homepage before any API calls. Cold API requests (no prior
+// page visit) trigger bot detection immediately. A real page load first
+// establishes the full cookie/header context Instagram expects, and makes
+// subsequent API calls look like natural in-page XHRs.
+console.log('Warming up session...');
+try {
+    await igPage.goto('https://www.instagram.com/', {
+        waitUntil: 'domcontentloaded',
+        timeout:   25_000,
+    });
+    await new Promise(r => setTimeout(r, 3_000)); // human-like pause
+    console.log('Warmup done');
+} catch (e) {
+    // Non-fatal — context.request works even if page nav fails
+    console.log(`Warmup warning (non-fatal): ${e.message.split('\n')[0]}`);
+    await new Promise(r => setTimeout(r, 2_000));
+}
 
 // ─── Rate limit state ─────────────────────────────────────────────────────────
 // Tracks consecutive 429s across all requests.
