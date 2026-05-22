@@ -1,0 +1,43 @@
+{
+    "title": "Instagram Follower Counter v2",
+    "description": "Fetches follower counts for Instagram usernames using multiple session rotation. No browser needed — pure HTTP with automatic session switching on rate limits.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "usernames": {
+            "title": "Usernames",
+            "type": "array",
+            "description": "Instagram usernames to look up. Do not include the @ symbol.",
+            "editor": "stringList",
+            "prefill": ["cristiano", "kyliejenner"]
+        },
+        "sessions": {
+            "title": "Instagram Sessions",
+            "type": "array",
+            "description": "One entry per Instagram account you own. The actor rotates through them automatically — when one gets rate limited, it switches to the next.\n\nHow to get sessionId + csrfToken:\n1. Log in to Instagram in Chrome\n2. Open DevTools → Application → Cookies → https://www.instagram.com\n3. Copy 'sessionid' and 'csrftoken' values\n\nFormat:\n[\n  { \"sessionId\": \"abc123\", \"csrfToken\": \"xyz789\" },\n  { \"sessionId\": \"def456\", \"csrfToken\": \"uvw012\" }\n]\n\nMore sessions = faster runs and less downtime from rate limits.",
+            "editor": "json",
+            "prefill": [
+                { "sessionId": "YOUR_SESSION_ID_1", "csrfToken": "YOUR_CSRF_TOKEN_1" },
+                { "sessionId": "YOUR_SESSION_ID_2", "csrfToken": "YOUR_CSRF_TOKEN_2" }
+            ]
+        },
+        "concurrency": {
+            "title": "Concurrency",
+            "type": "integer",
+            "description": "Number of parallel requests. Default 5 is safe. With 3+ sessions you can raise to 10–15. Too high risks faster rate limiting.",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 5,
+            "prefill": 5
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "editor": "proxy",
+            "description": "Residential proxies strongly recommended. Each session uses a consistent proxy URL to avoid IP-session mismatch.",
+            "default": { "useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"], "apifyProxyCountry": "US" },
+            "prefill": { "useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"], "apifyProxyCountry": "US" }
+        }
+    },
+    "required": ["usernames", "sessions"]
+}
